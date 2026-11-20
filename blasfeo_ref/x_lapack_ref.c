@@ -1671,6 +1671,171 @@ void REF_GETRF_FULLPIVOT(int m, int n, REAL tol, struct XMAT *sC, int ci, int cj
 
 
 #if ! ( defined(REF_BLAS) )
+// dgetrf rook pivoting, rank revealing
+// P * C * Q = L * U, with
+// P row permutation (ipiv), Q column permutation (jpiv),
+// L lower unit trapezoidal, U upper trapezoidal;
+// the pivot is the largest in absolute value in both its row and its column of the trailing block:
+// starting from the first column with an entry with absolute value > tol (and non-zero),
+// alternately search the column and the row of the current candidate, until it is not improved
+// (ties are broken by the first index);
+// the factorization stops when all the entries of the trailing block have absolute value <= tol (or are zero):
+// the first rank columns of L and rows of U are computed, and
+// the trailing (m-rank)x(n-rank) block of D holds the Schur complement
+void REF_GETRF_ROOKPIVOT(int m, int n, REAL tol, struct XMAT *sC, int ci, int cj, struct XMAT *sD, int di, int dj, int *ipiv, int *jpiv, int *rank)
+	{
+	int ii, jj, kk, ip, jp, it, jt;
+	REAL dtmp, dmax, cmax, rmax, d_00_inv, d_ij;
+#if defined(MF_COLMAJ) | defined(REF_BLAS)
+	int ldc = sC->m;
+	int ldd = sD->m;
+	REAL *pC = sC->pA + ci + cj*ldc;
+	REAL *pD = sD->pA + di + dj*ldd;
+	const int cci=0; const int ccj=0;
+	const int ddi=0; const int ddj=0;
+#else
+	int cci=ci; int ccj=cj;
+	int ddi=di; int ddj=dj;
+#endif
+	REAL *dD = sD->dA;
+	if(di==0 & dj==0)
+		// if zero offset getrf recomputes the right values
+		// for the stored inverse diagonal of sD
+		sD->use_dA = 1;
+	else
+		sD->use_dA = 0;
+	*rank = 0;
+	if(m<=0 | n<=0)
+		return;
+	// copy if needed
+	if(&XMATEL_C(cci, ccj)!=&XMATEL_D(ddi, ddj))
+		{
+		for(jj=0; jj<n; jj++)
+			{
+			for(ii=0; ii<m; ii++)
+				{
+				XMATEL_D(ddi+ii, ddj+jj) = XMATEL_C(cci+ii, ccj+jj);
+				}
+			}
+		}
+	int iimax = m<n ? m : n;
+	// factorize
+	for(ii=0; ii<iimax; ii++)
+		{
+		// first column of the trailing block with an entry with absolute value > tol (and non-zero)
+		dmax = 0.0;
+		ip = ii;
+		for(jp=ii; jp<n; jp++)
+			{
+			dmax = 0.0;
+			ip = ii;
+			for(kk=ii; kk<m; kk++)
+				{
+				dtmp = XMATEL_D(ddi+kk, ddj+jp);
+				dtmp = dtmp>0.0 ? dtmp : -dtmp;
+				if(dtmp>dmax)
+					{
+					dmax = dtmp;
+					ip = kk;
+					}
+				}
+			if(dmax>tol & dmax!=0.0)
+				break;
+			}
+		if(jp==n)
+			break;
+		// rook search: alternate row and column searches until the candidate is not improved
+		while(1)
+			{
+			// row search
+			rmax = 0.0;
+			jt = ii;
+			for(jj=ii; jj<n; jj++)
+				{
+				dtmp = XMATEL_D(ddi+ip, ddj+jj);
+				dtmp = dtmp>0.0 ? dtmp : -dtmp;
+				if(dtmp>rmax)
+					{
+					rmax = dtmp;
+					jt = jj;
+					}
+				}
+			if(!(rmax>dmax))
+				break;
+			dmax = rmax;
+			jp = jt;
+			// column search
+			cmax = 0.0;
+			it = ii;
+			for(kk=ii; kk<m; kk++)
+				{
+				dtmp = XMATEL_D(ddi+kk, ddj+jp);
+				dtmp = dtmp>0.0 ? dtmp : -dtmp;
+				if(dtmp>cmax)
+					{
+					cmax = dtmp;
+					it = kk;
+					}
+				}
+			if(!(cmax>dmax))
+				break;
+			dmax = cmax;
+			ip = it;
+			}
+		ipiv[ii] = ip;
+		jpiv[ii] = jp;
+		// swap rows
+		if(ip!=ii)
+			{
+			for(jj=0; jj<n; jj++)
+				{
+				dtmp = XMATEL_D(ddi+ii, ddj+jj);
+				XMATEL_D(ddi+ii, ddj+jj) = XMATEL_D(ddi+ip, ddj+jj);
+				XMATEL_D(ddi+ip, ddj+jj) = dtmp;
+				}
+			}
+		// swap columns
+		if(jp!=ii)
+			{
+			for(kk=0; kk<m; kk++)
+				{
+				dtmp = XMATEL_D(ddi+kk, ddj+ii);
+				XMATEL_D(ddi+kk, ddj+ii) = XMATEL_D(ddi+kk, ddj+jp);
+				XMATEL_D(ddi+kk, ddj+jp) = dtmp;
+				}
+			}
+		// scale column of L
+		d_00_inv = 1.0/XMATEL_D(ddi+ii, ddj+ii);
+		dD[ii] = d_00_inv;
+		for(kk=ii+1; kk<m; kk++)
+			{
+			XMATEL_D(ddi+kk, ddj+ii) *= d_00_inv;
+			}
+		// rank-1 update of the trailing block
+		for(jj=ii+1; jj<n; jj++)
+			{
+			d_ij = XMATEL_D(ddi+ii, ddj+jj);
+			for(kk=ii+1; kk<m; kk++)
+				{
+				XMATEL_D(ddi+kk, ddj+jj) = XMATEL_D(ddi+kk, ddj+jj) - XMATEL_D(ddi+kk, ddj+ii) * d_ij;
+				}
+			}
+		}
+	*rank = ii;
+	// no pivoting on the rank deficient part
+	for(; ii<iimax; ii++)
+		{
+		ipiv[ii] = ii;
+		jpiv[ii] = ii;
+		dD[ii] = 0.0;
+		}
+	return;
+	}
+#endif
+
+
+
+#if ! ( defined(REF_BLAS) )
 int REF_GEQRF_WORK_SIZE(int m, int n)
 	{
 	return 0;
@@ -3492,6 +3657,15 @@ void GETRF_ROWPIVOT(int m, int n, struct XMAT *sC, int ci, int cj, struct XMAT *
 void GETRF_FULLPIVOT(int m, int n, REAL tol, struct XMAT *sC, int ci, int cj, struct XMAT *sD, int di, int dj, int *ipiv, int *jpiv, int *rank)
 	{
 	REF_GETRF_FULLPIVOT(m, n, tol, sC, ci, cj, sD, di, dj, ipiv, jpiv, rank);
+	}
+#endif
+
+
+
+#if ! ( defined(REF_BLAS) )
+void GETRF_ROOKPIVOT(int m, int n, REAL tol, struct XMAT *sC, int ci, int cj, struct XMAT *sD, int di, int dj, int *ipiv, int *jpiv, int *rank)
+	{
+	REF_GETRF_ROOKPIVOT(m, n, tol, sC, ci, cj, sD, di, dj, ipiv, jpiv, rank);
 	}
 #endif
 

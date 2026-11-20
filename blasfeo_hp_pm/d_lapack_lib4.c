@@ -3787,6 +3787,545 @@ void blasfeo_hp_dgetrf_fp(int m, int n, double tol, struct blasfeo_dmat *sC, int
 	}
 
 
+// largest absolute value (first in case of ties) in rows k0,...,me-1 of a column of a lib4 matrix;
+// pD points to the column in the first panel, rows are indexed from the beginning of the first panel
+static void blasfeo_hp_dcolamax_lib4(int k0, int me, double *pD, int sdd, double *ptr_amax, int *ptr_iamax)
+	{
+	const int ps = 4;
+	int k1, kk, ll, kp;
+	double c_0, m_0, amax;
+	double m_v[4];
+	double *pDk;
+	amax = 0.0;
+	kp = k0;
+	// largest absolute value per panel (branchless), keep the first panel with the overall largest
+	for(kk=k0; kk<me; kk=k1)
+		{
+		k1 = (kk | (ps-1)) + 1;
+		k1 = k1<me ? k1 : me;
+		pDk = pD + (kk & ~(ps-1))*sdd;
+		if(k1-kk==ps)
+			{
+			for(ll=0; ll<ps; ll++)
+				m_v[ll] = fabs(pDk[ll]);
+			m_0 = m_v[0]>m_v[1] ? m_v[0] : m_v[1];
+			c_0 = m_v[2]>m_v[3] ? m_v[2] : m_v[3];
+			m_0 = m_0>c_0 ? m_0 : c_0;
+			}
+		else
+			{
+			m_0 = 0.0;
+			for(ll=kk; ll<k1; ll++)
+				{
+				c_0 = fabs(pDk[ll&(ps-1)]);
+				m_0 = m_0>c_0 ? m_0 : c_0;
+				}
+			}
+		if(m_0>amax)
+			{
+			amax = m_0;
+			kp = kk;
+			}
+		}
+	// first row of the panel with the largest absolute value
+	if(amax>0.0)
+		{
+		pDk = pD + (kp & ~(ps-1))*sdd;
+		while(fabs(pDk[kp&(ps-1)])!=amax)
+			kp++;
+		}
+	else
+		{
+		kp = k0;
+		}
+	*ptr_amax = amax;
+	*ptr_iamax = kp;
+	return;
+	}
+
+
+
+// blocked rook pivoting: the trailing matrix is updated once per block of D_GETRF_RK_NB pivots
+// using dgemm; within a block, the searched rows and columns are computed on the fly with dgemv
+// from the delayed updates
+#define D_GETRF_RK_NB 16
+// use the blocked algorithm for min(m,n) >= D_GETRF_RK_BLOCK_MIN
+#define D_GETRF_RK_BLOCK_MIN 96
+
+
+
+// largest absolute value (first in case of ties) of the n entries of x
+static void blasfeo_hp_damax(int n, double *x, double *ptr_amax, int *ptr_iamax)
+	{
+	int ii, imax;
+	double c_0, amax;
+	amax = 0.0;
+	imax = 0;
+	for(ii=0; ii<n; ii++)
+		{
+		c_0 = fabs(x[ii]);
+		if(c_0>amax)
+			{
+			amax = c_0;
+			imax = ii;
+			}
+		}
+	*ptr_amax = amax;
+	*ptr_iamax = imax;
+	return;
+	}
+
+
+
+// column c of the trailing matrix in rows r,...,m-1 (relative to di), including the delayed update
+// from the nl columns of L and rows of U starting at k0: w = D(r:m,c) - L(r:m,k0:k0+nl) * U(k0:k0+nl,c)
+static void blasfeo_hp_dgetrf_rk_col(int m, int r, int c, int k0, int nl, struct blasfeo_dmat *sD, int di, int dj, struct blasfeo_dvec *sw, struct blasfeo_dvec *su)
+	{
+	const int ps = 4;
+	int dir = di & (ps-1);
+	int sdd = sD->cn;
+	double *pD = sD->pA + dj*ps + (di - dir)*sdd;
+	double *w = sw->pa;
+	double *u = su->pa;
+	double *pDk;
+	int k0r, k1, kk, l;
+	// gather column
+	for(k0r=r+dir; k0r<m+dir; k0r=k1)
+		{
+		k1 = (k0r | (ps-1)) + 1;
+		k1 = k1<m+dir ? k1 : m+dir;
+		pDk = pD + (k0r & ~(ps-1))*sdd + c*ps;
+		for(kk=k0r; kk<k1; kk++)
+			w[kk-dir-r] = pDk[kk&(ps-1)];
+		}
+	if(nl>0)
+		{
+		for(l=0; l<nl; l++)
+			{
+			kk = k0 + l + dir;
+			u[l] = pD[(kk & ~(ps-1))*sdd+(kk&(ps-1))+c*ps];
+			}
+		blasfeo_dgemv_n(m-r, nl, -1.0, sD, di+r, dj+k0, su, 0, 1.0, sw, 0, sw, 0);
+		}
+	return;
+	}
+
+
+
+// row r (relative to di) of the trailing matrix in columns c,...,n-1, including the delayed update
+// from the nl columns of L and rows of U starting at k0: v = D(r,c:n) - L(r,k0:k0+nl) * U(k0:k0+nl,c:n)
+static void blasfeo_hp_dgetrf_rk_row(int n, int r, int c, int k0, int nl, struct blasfeo_dmat *sD, int di, int dj, struct blasfeo_dvec *sv, struct blasfeo_dvec *sl)
+	{
+	const int ps = 4;
+	int dir = di & (ps-1);
+	int sdd = sD->cn;
+	int rr = r + dir;
+	double *pr = sD->pA + dj*ps + (di - dir)*sdd + (rr & ~(ps-1))*sdd + (rr&(ps-1));
+	double *v = sv->pa;
+	double *lr = sl->pa;
+	int jj, l;
+	// gather row
+	for(jj=c; jj<n; jj++)
+		v[jj-c] = pr[jj*ps];
+	if(nl>0)
+		{
+		for(l=0; l<nl; l++)
+			lr[l] = pr[(k0+l)*ps];
+		blasfeo_dgemv_t(nl, n-c, -1.0, sD, di+k0, dj+c, sl, 0, 1.0, sv, 0, sv, 0);
+		}
+	return;
+	}
+
+
+
+// blocked rook pivoting on D (already holding a copy of C), returns the rank
+static int blasfeo_hp_dgetrf_rk_blk_lib4(int m, int n, double tol, struct blasfeo_dmat *sD, int di, int dj, int *ipiv, int *jpiv)
+	{
+	const int ps = 4;
+	int dir = di & (ps-1);
+	int sdd = sD->cn;
+	double *pD = sD->pA + dj*ps + (di - dir)*sdd;
+	double *dD = sD->dA;
+
+	int ii, jj, kk, k0, k1, kb, nl, rr, ip, jp, it, jt, rank;
+	double tmp, dmax, rmax, cmax, d_00_inv;
+	double *pDi, *pDj, *pDk;
+
+	int p = m<n ? m : n;
+	// rows are indexed from the beginning of the first panel of D
+	int me = m + dir;
+
+	// work space: column w (m), row v (n), U column u and L row l (D_GETRF_RK_NB each)
+	int mw = (m+7)/8*8;
+	int nw = (n+7)/8*8;
+	int sw = mw + nw + 2*D_GETRF_RK_NB;
+	ALIGNED( double work0[4*K_MAX_STACK], 64 );
+	double *work = work0;
+	void *mem = NULL;
+	if(sw>4*K_MAX_STACK)
+		{
+		mem = malloc(sw*sizeof(double)+64);
+		work = (double *) ((((size_t) mem) + 63) / 64 * 64);
+		}
+	struct blasfeo_dvec svw, svv, svu, svl;
+	blasfeo_create_dvec(m, &svw, work);
+	blasfeo_create_dvec(n, &svv, work+mw);
+	blasfeo_create_dvec(D_GETRF_RK_NB, &svu, work+mw+nw);
+	blasfeo_create_dvec(D_GETRF_RK_NB, &svl, work+mw+nw+D_GETRF_RK_NB);
+	double *w = svw.pa;
+	double *v = svv.pa;
+
+	rank = p;
+	for(k0=0; k0<p; k0=kb)
+		{
+		kb = k0+D_GETRF_RK_NB<p ? k0+D_GETRF_RK_NB : p;
+		for(ii=k0; ii<kb; ii++)
+			{
+			// number of delayed updates
+			nl = ii - k0;
+			// row ii
+			rr = ii + dir;
+			// first column of the trailing matrix with an entry with absolute value > tol (and non-zero)
+			for(jp=ii; jp<n; jp++)
+				{
+				blasfeo_hp_dgetrf_rk_col(m, ii, jp, k0, nl, sD, di, dj, &svw, &svu);
+				blasfeo_hp_damax(m-ii, w, &dmax, &ip);
+				if(dmax>tol & dmax!=0.0)
+					break;
+				}
+			if(jp==n)
+				{
+				// rank deficient: apply the delayed update, the trailing matrix holds the Schur complement
+				if(nl>0)
+					blasfeo_dgemm_nn(m-ii, n-ii, nl, -1.0, sD, di+ii, dj+k0, sD, di+k0, dj+ii, 1.0, sD, di+ii, dj+ii, sD, di+ii, dj+ii);
+				rank = ii;
+				goto end;
+				}
+			ip += ii;
+			// rook search: on exit, w holds column jp and v holds row ip, both updated
+			while(1)
+				{
+				blasfeo_hp_dgetrf_rk_row(n, ip, ii, k0, nl, sD, di, dj, &svv, &svl);
+				blasfeo_hp_damax(n-ii, v, &rmax, &jt);
+				if(!(rmax>dmax))
+					break;
+				dmax = rmax;
+				jp = jt + ii;
+				blasfeo_hp_dgetrf_rk_col(m, ii, jp, k0, nl, sD, di, dj, &svw, &svu);
+				blasfeo_hp_damax(m-ii, w, &cmax, &it);
+				if(!(cmax>dmax))
+					break;
+				dmax = cmax;
+				ip = it + ii;
+				}
+			ipiv[ii] = ip;
+			jpiv[ii] = jp;
+			// pointer to row ii
+			pDi = pD + (rr & ~(ps-1))*sdd + (rr&(ps-1));
+			// swap rows
+			if(ip!=ii)
+				{
+				kk = ip + dir;
+				pDj = pD + (kk & ~(ps-1))*sdd + (kk&(ps-1));
+				for(jj=0; jj<n; jj++)
+					{
+					tmp = pDi[jj*ps];
+					pDi[jj*ps] = pDj[jj*ps];
+					pDj[jj*ps] = tmp;
+					}
+				tmp = w[0];
+				w[0] = w[ip-ii];
+				w[ip-ii] = tmp;
+				}
+			// swap columns
+			if(jp!=ii)
+				{
+				for(k1=dir; k1<me; k1+=ps-(k1&(ps-1)))
+					{
+					pDk = pD + (k1 & ~(ps-1))*sdd;
+					for(kk=k1; kk<me & kk<((k1|(ps-1))+1); kk++)
+						{
+						tmp = pDk[(kk&(ps-1))+ii*ps];
+						pDk[(kk&(ps-1))+ii*ps] = pDk[(kk&(ps-1))+jp*ps];
+						pDk[(kk&(ps-1))+jp*ps] = tmp;
+						}
+					}
+				tmp = v[0];
+				v[0] = v[jp-ii];
+				v[jp-ii] = tmp;
+				}
+			// store the updated column of L, scaled by the inverse of the pivot, and row of U
+			d_00_inv = 1.0/w[0];
+			dD[ii] = d_00_inv;
+			pDi[ii*ps] = w[0];
+			for(k1=rr+1; k1<me; k1+=ps-(k1&(ps-1)))
+				{
+				pDk = pD + (k1 & ~(ps-1))*sdd + ii*ps;
+				for(kk=k1; kk<me & kk<((k1|(ps-1))+1); kk++)
+					{
+					pDk[kk&(ps-1)] = w[kk-rr] * d_00_inv;
+					}
+				}
+			if(nl>0)
+				{
+				for(jj=ii+1; jj<n; jj++)
+					pDi[jj*ps] = v[jj-ii];
+				}
+			}
+		// update of the trailing matrix
+		if(kb<m & kb<n)
+			blasfeo_dgemm_nn(m-kb, n-kb, kb-k0, -1.0, sD, di+kb, dj+k0, sD, di+k0, dj+kb, 1.0, sD, di+kb, dj+kb, sD, di+kb, dj+kb);
+		}
+
+	end:
+	if(mem!=NULL)
+		free(mem);
+
+	return rank;
+	}
+
+
+
+// dgetrf rook pivoting, rank revealing
+void blasfeo_hp_dgetrf_rk(int m, int n, double tol, struct blasfeo_dmat *sC, int ci, int cj, struct blasfeo_dmat *sD, int di, int dj, int *ipiv, int *jpiv, int *rank)
+	{
+
+	const int ps = 4;
+
+	int cir = ci & (ps-1);
+	int dir = di & (ps-1);
+
+	int sdc = sC->cn;
+	int sdd = sD->cn;
+	double *pC = sC->pA + cj*ps + (ci - cir)*sdc;
+	double *pD = sD->pA + dj*ps + (di - dir)*sdd;
+	double *dD = sD->dA;
+
+	if(di==0 && dj==0)
+		sD->use_dA = 1;
+	else
+		sD->use_dA = 0;
+
+	*rank = 0;
+
+	if(m<=0 | n<=0)
+		return;
+
+	if(pC+cir!=pD+dir)
+		blasfeo_dgecp(m, n, sC, ci, cj, sD, di, dj);
+
+	int ii, jj, kk, ll, ip, jp, it, jt, k0, k1;
+
+	int p = m<n ? m : n;
+
+	if(p>=D_GETRF_RK_BLOCK_MIN)
+		{
+		ii = blasfeo_hp_dgetrf_rk_blk_lib4(m, n, tol, sD, di, dj, ipiv, jpiv);
+		*rank = ii;
+		// no pivoting on the rank deficient part
+		for(; ii<p; ii++)
+			{
+			ipiv[ii] = ii;
+			jpiv[ii] = ii;
+			dD[ii] = 0.0;
+			}
+		// dgemm invalidates the stored inverse diagonal
+		if(di==0 && dj==0)
+			sD->use_dA = 1;
+		else
+			sD->use_dA = 0;
+		return;
+		}
+
+	double tmp, dmax, cmax, rmax, d_00_inv, d_ij, c_0, m_0, dmax_n;
+	double l_v[4], m_v[4];
+	int ip_n;
+	double *pDi, *pDj, *pDk;
+
+	// rows are indexed from the beginning of the first panel of D
+	int me = m + dir;
+
+	// the pivot is the largest in absolute value in both its row and its column of the trailing matrix:
+	// starting from the first column with an entry with absolute value > tol (and non-zero), the row
+	// and the column of the current candidate are searched alternately, until it is not improved;
+	// ties are broken by the first index, as in the reference implementation
+
+	// largest absolute value in the first column; in the following steps, it is computed for
+	// column ii+1 during the rank-1 update
+	blasfeo_hp_dcolamax_lib4(dir, me, pD, sdd, &dmax_n, &ip_n);
+
+	// factorize
+	for(ii=0; ii<p; ii++)
+		{
+		// row ii
+		kk = ii + dir;
+		// first column of the trailing matrix with an entry with absolute value > tol (and non-zero)
+		dmax = dmax_n;
+		ip = ip_n;
+		jp = ii;
+		if(!(dmax>tol & dmax!=0.0))
+			{
+			for(jp=ii+1; jp<n; jp++)
+				{
+				blasfeo_hp_dcolamax_lib4(kk, me, pD+jp*ps, sdd, &dmax, &ip);
+				if(dmax>tol & dmax!=0.0)
+					break;
+				}
+			if(jp>=n)
+				break;
+			}
+		// rook search
+		while(1)
+			{
+			// row search: largest absolute value (branchless), then its first column only if it improves
+			pDk = pD + (ip & ~(ps-1))*sdd + (ip&(ps-1));
+			rmax = 0.0;
+			for(jj=ii; jj<n; jj++)
+				{
+				c_0 = fabs(pDk[jj*ps]);
+				rmax = rmax>c_0 ? rmax : c_0;
+				}
+			if(!(rmax>dmax))
+				break;
+			for(jt=ii; fabs(pDk[jt*ps])!=rmax; jt++)
+				;
+			dmax = rmax;
+			jp = jt;
+			// column search
+			blasfeo_hp_dcolamax_lib4(kk, me, pD+jp*ps, sdd, &cmax, &it);
+			if(!(cmax>dmax))
+				break;
+			dmax = cmax;
+			ip = it;
+			}
+		ipiv[ii] = ip - dir;
+		jpiv[ii] = jp;
+		// pointer to row ii
+		pDi = pD + (kk & ~(ps-1))*sdd + (kk&(ps-1));
+		// swap rows
+		if(ip!=kk)
+			{
+			pDj = pD + (ip & ~(ps-1))*sdd + (ip&(ps-1));
+			for(jj=0; jj<n; jj++)
+				{
+				tmp = pDi[jj*ps];
+				pDi[jj*ps] = pDj[jj*ps];
+				pDj[jj*ps] = tmp;
+				}
+			}
+		// swap columns
+		if(jp!=ii)
+			{
+			for(k0=dir; k0<me; k0=k1)
+				{
+				k1 = (k0 | (ps-1)) + 1;
+				k1 = k1<me ? k1 : me;
+				pDk = pD + (k0 & ~(ps-1))*sdd;
+				for(it=k0; it<k1; it++)
+					{
+					tmp = pDk[(it&(ps-1))+ii*ps];
+					pDk[(it&(ps-1))+ii*ps] = pDk[(it&(ps-1))+jp*ps];
+					pDk[(it&(ps-1))+jp*ps] = tmp;
+					}
+				}
+			}
+		d_00_inv = 1.0/pDi[ii*ps];
+		dD[ii] = d_00_inv;
+		// scale column of L and rank-1 update of the trailing matrix;
+		// the largest absolute value of column ii+1 is computed on the fly (first panel containing it)
+		dmax_n = 0.0;
+		ip_n = kk+1;
+		for(k0=kk+1; k0<me; k0=k1)
+			{
+			k1 = (k0 | (ps-1)) + 1;
+			k1 = k1<me ? k1 : me;
+			pDk = pD + (k0 & ~(ps-1))*sdd;
+			m_0 = 0.0;
+			if(k1-k0==ps)
+				{
+				for(ll=0; ll<ps; ll++)
+					{
+					l_v[ll] = pDk[ll+ii*ps] * d_00_inv;
+					pDk[ll+ii*ps] = l_v[ll];
+					}
+				if(ii+1<n)
+					{
+					d_ij = pDi[(ii+1)*ps];
+					for(ll=0; ll<ps; ll++)
+						{
+						c_0 = pDk[ll+(ii+1)*ps] - l_v[ll] * d_ij;
+						pDk[ll+(ii+1)*ps] = c_0;
+						m_v[ll] = fabs(c_0);
+						}
+					m_0 = m_v[0]>m_v[1] ? m_v[0] : m_v[1];
+					c_0 = m_v[2]>m_v[3] ? m_v[2] : m_v[3];
+					m_0 = m_0>c_0 ? m_0 : c_0;
+					}
+				for(jj=ii+2; jj<n; jj++)
+					{
+					d_ij = pDi[jj*ps];
+					for(ll=0; ll<ps; ll++)
+						{
+						pDk[ll+jj*ps] = pDk[ll+jj*ps] - l_v[ll] * d_ij;
+						}
+					}
+				}
+			else
+				{
+				for(it=k0; it<k1; it++)
+					{
+					pDk[(it&(ps-1))+ii*ps] *= d_00_inv;
+					}
+				if(ii+1<n)
+					{
+					d_ij = pDi[(ii+1)*ps];
+					for(it=k0; it<k1; it++)
+						{
+						c_0 = pDk[(it&(ps-1))+(ii+1)*ps] - pDk[(it&(ps-1))+ii*ps] * d_ij;
+						pDk[(it&(ps-1))+(ii+1)*ps] = c_0;
+						c_0 = fabs(c_0);
+						m_0 = m_0>c_0 ? m_0 : c_0;
+						}
+					}
+				for(jj=ii+2; jj<n; jj++)
+					{
+					d_ij = pDi[jj*ps];
+					for(it=k0; it<k1; it++)
+						{
+						pDk[(it&(ps-1))+jj*ps] = pDk[(it&(ps-1))+jj*ps] - pDk[(it&(ps-1))+ii*ps] * d_ij;
+						}
+					}
+				}
+			if(m_0>dmax_n)
+				{
+				dmax_n = m_0;
+				ip_n = k0;
+				}
+			}
+		// first row of the panel with the largest absolute value in column ii+1
+		if(dmax_n>0.0)
+			{
+			pDk = pD + (ip_n & ~(ps-1))*sdd + (ii+1)*ps;
+			while(fabs(pDk[ip_n&(ps-1)])!=dmax_n)
+				ip_n++;
+			}
+		}
+
+	*rank = ii;
+
+	// no pivoting on the rank deficient part
+	for(; ii<p; ii++)
+		{
+		ipiv[ii] = ii;
+		jpiv[ii] = ii;
+		dD[ii] = 0.0;
+		}
+
+	return;
+
+	}
+
+
 
 int blasfeo_hp_dgeqrf_worksize(int m, int n)
 	{
@@ -4710,6 +5249,13 @@ void blasfeo_dgetrf_rp(int m, int n, struct blasfeo_dmat *sC, int ci, int cj, st
 void blasfeo_dgetrf_fp(int m, int n, double tol, struct blasfeo_dmat *sC, int ci, int cj, struct blasfeo_dmat *sD, int di, int dj, int *ipiv, int *jpiv, int *rank)
 	{
 	blasfeo_hp_dgetrf_fp(m, n, tol, sC, ci, cj, sD, di, dj, ipiv, jpiv, rank);
+	}
+
+
+
+void blasfeo_dgetrf_rk(int m, int n, double tol, struct blasfeo_dmat *sC, int ci, int cj, struct blasfeo_dmat *sD, int di, int dj, int *ipiv, int *jpiv, int *rank)
+	{
+	blasfeo_hp_dgetrf_rk(m, n, tol, sC, ci, cj, sD, di, dj, ipiv, jpiv, rank);
 	}
 
 

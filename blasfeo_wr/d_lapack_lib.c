@@ -78,6 +78,7 @@
 #define GETRF_FULLPIVOT blasfeo_dgetrf_fp
 #define GETRF_NOPIVOT blasfeo_dgetrf_np
 #define GETRF_ROWPIVOT blasfeo_dgetrf_rp
+#define GETRF_ROOKPIVOT blasfeo_dgetrf_rk
 #define POTRF_L blasfeo_dpotrf_l
 #define POTRF_L_MN blasfeo_dpotrf_l_mn
 #define POTRF_U blasfeo_dpotrf_u

@@ -538,6 +538,141 @@ void GETRF_FULLPIVOT(int m, int n, REAL tol, struct XMAT *sC, int ci, int cj, st
 	}
 
 
+// dgetrf rook pivoting, rank revealing
+void GETRF_ROOKPIVOT(int m, int n, REAL tol, struct XMAT *sC, int ci, int cj, struct XMAT *sD, int di, int dj, int *ipiv, int *jpiv, int *rank)
+	{
+	*rank = 0;
+	if(m<=0 | n<=0)
+		return;
+
+	// invalidate stored inverse diagonal of result matrix
+	sD->use_dA = 0;
+
+	int ii, jj, kk, ip, jp, it, jt;
+	REAL tmp, dmax, cmax, rmax, d_00_inv, d_ij;
+	REAL *pC = sC->pA+ci+cj*sC->m;
+	REAL *pD = sD->pA+di+dj*sD->m;
+	int i1 = 1;
+	int ldc = sC->m;
+	int ldd = sD->m;
+	if(!(pC==pD))
+		{
+		for(jj=0; jj<n; jj++)
+			COPY(&m, pC+jj*ldc, &i1, pD+jj*ldd, &i1);
+		}
+	int iimax = m<n ? m : n;
+	// factorize
+	for(ii=0; ii<iimax; ii++)
+		{
+		// first column of the trailing block with an entry with absolute value > tol (and non-zero)
+		dmax = 0.0;
+		ip = ii;
+		for(jp=ii; jp<n; jp++)
+			{
+			dmax = 0.0;
+			ip = ii;
+			for(kk=ii; kk<m; kk++)
+				{
+				tmp = pD[kk+jp*ldd];
+				tmp = tmp>0.0 ? tmp : -tmp;
+				if(tmp>dmax)
+					{
+					dmax = tmp;
+					ip = kk;
+					}
+				}
+			if(dmax>tol & dmax!=0.0)
+				break;
+			}
+		if(jp==n)
+			break;
+		// rook search: alternate row and column searches until the candidate is not improved
+		while(1)
+			{
+			// row search
+			rmax = 0.0;
+			jt = ii;
+			for(jj=ii; jj<n; jj++)
+				{
+				tmp = pD[ip+jj*ldd];
+				tmp = tmp>0.0 ? tmp : -tmp;
+				if(tmp>rmax)
+					{
+					rmax = tmp;
+					jt = jj;
+					}
+				}
+			if(!(rmax>dmax))
+				break;
+			dmax = rmax;
+			jp = jt;
+			// column search
+			cmax = 0.0;
+			it = ii;
+			for(kk=ii; kk<m; kk++)
+				{
+				tmp = pD[kk+jp*ldd];
+				tmp = tmp>0.0 ? tmp : -tmp;
+				if(tmp>cmax)
+					{
+					cmax = tmp;
+					it = kk;
+					}
+				}
+			if(!(cmax>dmax))
+				break;
+			dmax = cmax;
+			ip = it;
+			}
+		ipiv[ii] = ip;
+		jpiv[ii] = jp;
+		// swap rows
+		if(ip!=ii)
+			{
+			for(jj=0; jj<n; jj++)
+				{
+				tmp = pD[ii+jj*ldd];
+				pD[ii+jj*ldd] = pD[ip+jj*ldd];
+				pD[ip+jj*ldd] = tmp;
+				}
+			}
+		// swap columns
+		if(jp!=ii)
+			{
+			for(kk=0; kk<m; kk++)
+				{
+				tmp = pD[kk+ii*ldd];
+				pD[kk+ii*ldd] = pD[kk+jp*ldd];
+				pD[kk+jp*ldd] = tmp;
+				}
+			}
+		// scale column of L
+		d_00_inv = 1.0/pD[ii+ii*ldd];
+		for(kk=ii+1; kk<m; kk++)
+			{
+			pD[kk+ii*ldd] *= d_00_inv;
+			}
+		// rank-1 update of the trailing block
+		for(jj=ii+1; jj<n; jj++)
+			{
+			d_ij = pD[ii+jj*ldd];
+			for(kk=ii+1; kk<m; kk++)
+				{
+				pD[kk+jj*ldd] -= pD[kk+ii*ldd] * d_ij;
+				}
+			}
+		}
+	*rank = ii;
+	// no pivoting on the rank deficient part
+	for(; ii<iimax; ii++)
+		{
+		ipiv[ii] = ii;
+		jpiv[ii] = ii;
+		}
+	return;
+	}
+
+
 
 int GEQRF_WORK_SIZE(int m, int n)
 	{
