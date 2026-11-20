@@ -1611,6 +1611,14 @@ void blasfeo_dgetrf_fp(int m, int n, double tol, struct blasfeo_dmat *sC, int ci
 
 
 
+// optimized version only for lib4, forward to the original
+void blasfeo_dgetrf_fp_optimized(int m, int n, double tol, struct blasfeo_dmat *sC, int ci, int cj, struct blasfeo_dmat *sD, int di, int dj, int *ipiv, int *jpiv, int *rank)
+	{
+	blasfeo_hp_dgetrf_fp(m, n, tol, sC, ci, cj, sD, di, dj, ipiv, jpiv, rank);
+	}
+
+
+
 void blasfeo_dgetrf_rk(int m, int n, double tol, struct blasfeo_dmat *sC, int ci, int cj, struct blasfeo_dmat *sD, int di, int dj, int *ipiv, int *jpiv, int *rank)
 	{
 	blasfeo_hp_dgetrf_rk(m, n, tol, sC, ci, cj, sD, di, dj, ipiv, jpiv, rank);

@@ -36,6 +36,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
+#include <float.h>
 
 #include <blasfeo_common.h>
 #include <blasfeo_s_aux.h>
@@ -1479,7 +1480,7 @@ void blasfeo_hp_sgetrf_fp(int m, int n, float tol, struct blasfeo_smat *sC, int 
 
 // largest absolute value (first in case of ties) in rows k0,...,me-1 of a column of a lib4 matrix;
 // pD points to the column in the first panel, rows are indexed from the beginning of the first panel
-static void blasfeo_hp_scolamax_lib4(int k0, int me, float *pD, int sdd, float *ptr_amax, int *ptr_iamax)
+static inline void blasfeo_hp_scolamax_lib4(int k0, int me, float *pD, int sdd, float *ptr_amax, int *ptr_iamax)
 	{
 	const int ps = 4;
 	int k1, kk, ll, kp;
@@ -1530,6 +1531,34 @@ static void blasfeo_hp_scolamax_lib4(int k0, int me, float *pD, int sdd, float *
 		}
 	*ptr_amax = amax;
 	*ptr_iamax = kp;
+	return;
+	}
+
+
+
+// largest absolute value (first in column-major order) in rows k0,...,me-1 and columns j0,...,n-1
+// of a lib4 matrix; rows are indexed from the beginning of the first panel
+static void blasfeo_hp_sgeamax_lib4(int k0, int me, int j0, int n, float *pD, int sdd, float *ptr_amax, int *ptr_iamax, int *ptr_jamax)
+	{
+	const int ps = 4;
+	int jj, it, imax, jmax;
+	float c_0, amax;
+	amax = 0.0;
+	imax = k0;
+	jmax = j0;
+	for(jj=j0; jj<n; jj++)
+		{
+		blasfeo_hp_scolamax_lib4(k0, me, pD+jj*ps, sdd, &c_0, &it);
+		if(c_0>amax)
+			{
+			amax = c_0;
+			imax = it;
+			jmax = jj;
+			}
+		}
+	*ptr_amax = amax;
+	*ptr_iamax = imax;
+	*ptr_jamax = jmax;
 	return;
 	}
 
@@ -1637,8 +1666,8 @@ static int blasfeo_hp_sgetrf_rk_blk_lib4(int m, int n, float tol, struct blasfeo
 	float *pD = sD->pA + dj*ps + (di - dir)*sdd;
 	float *dD = sD->dA;
 
-	int ii, jj, kk, k0, k1, kb, nl, rr, ip, jp, it, jt, rank;
-	float tmp, dmax, rmax, cmax, d_00_inv;
+	int ii, jj, kk, k0, k1, kb, nl, rr, ip, jp, it, jt, iw, rank;
+	float tmp, dmax, rmax, cmax, wmax, d_00_inv;
 	float *pDi, *pDj, *pDk;
 
 	int p = m<n ? m : n;
@@ -1675,22 +1704,13 @@ static int blasfeo_hp_sgetrf_rk_blk_lib4(int m, int n, float tol, struct blasfeo
 			nl = ii - k0;
 			// row ii
 			rr = ii + dir;
-			// first column of the trailing matrix with an entry with absolute value > tol (and non-zero)
-			for(jp=ii; jp<n; jp++)
-				{
-				blasfeo_hp_sgetrf_rk_col(m, ii, jp, k0, nl, sD, di, dj, &svw, &svu);
-				blasfeo_hp_samax(m-ii, w, &dmax, &ip);
-				if(dmax>tol & dmax!=0.0)
-					break;
-				}
-			if(jp==n)
-				{
-				// rank deficient: apply the delayed update, the trailing matrix holds the Schur complement
-				if(nl>0)
-					blasfeo_sgemm_nn(m-ii, n-ii, nl, -1.0, sD, di+ii, dj+k0, sD, di+k0, dj+ii, 1.0, sD, di+ii, dj+ii, sD, di+ii, dj+ii);
-				rank = ii;
-				goto end;
-				}
+			// largest absolute value in the first column of the trailing matrix
+			jp = ii;
+			blasfeo_hp_sgetrf_rk_col(m, ii, jp, k0, nl, sD, di, dj, &svw, &svu);
+			blasfeo_hp_samax(m-ii, w, &dmax, &ip);
+			// largest absolute value of the computed column w, and its first row
+			wmax = dmax;
+			iw = ip;
 			ip += ii;
 			// rook search: on exit, w holds column jp and v holds row ip, both updated
 			while(1)
@@ -1703,10 +1723,53 @@ static int blasfeo_hp_sgetrf_rk_blk_lib4(int m, int n, float tol, struct blasfeo
 				jp = jt + ii;
 				blasfeo_hp_sgetrf_rk_col(m, ii, jp, k0, nl, sD, di, dj, &svw, &svu);
 				blasfeo_hp_samax(m-ii, w, &cmax, &it);
+				wmax = cmax;
+				iw = it;
 				if(!(cmax>dmax))
 					break;
 				dmax = cmax;
 				ip = it + ii;
+				}
+			// small rook pivot: verify the rank decision with a full search of the trailing matrix, as in
+			// complete pivoting; the delayed update is applied first, and the block restarts at ii
+			if(!(dmax>tol & dmax!=0.0))
+				{
+				if(nl>0)
+					{
+					blasfeo_sgemm_nn(m-ii, n-ii, nl, -1.0, sD, di+ii, dj+k0, sD, di+k0, dj+ii, 1.0, sD, di+ii, dj+ii, sD, di+ii, dj+ii);
+					k0 = ii;
+					nl = 0;
+					}
+				blasfeo_hp_sgeamax_lib4(rr, me, ii, n, pD, sdd, &dmax, &ip, &jp);
+				if(!(dmax>tol & dmax!=0.0))
+					{
+					// numerical rank ii: the trailing matrix holds the Schur complement
+					rank = ii;
+					goto end;
+					}
+				// complete pivoting step
+				ip -= dir;
+				blasfeo_hp_sgetrf_rk_col(m, ii, jp, k0, nl, sD, di, dj, &svw, &svu);
+				blasfeo_hp_samax(m-ii, w, &wmax, &iw);
+				blasfeo_hp_sgetrf_rk_row(n, ip, ii, k0, nl, sD, di, dj, &svv, &svl);
+				}
+			// the entries of the searched rows and columns are computed separately (gemv_t and gemv_n) and
+			// rounded differently, which matters if the trailing matrix is at rounding level (rank deficient
+			// matrices): make the pivot the largest in absolute value in its computed column w, so that
+			// |L| <= 1, and (in a few steps of rook search on the computed values) in its computed row v
+			for(it=0; it<4; it++)
+				{
+				if(wmax>fabsf(w[ip-ii]))
+					{
+					ip = iw + ii;
+					blasfeo_hp_sgetrf_rk_row(n, ip, ii, k0, nl, sD, di, dj, &svv, &svl);
+					}
+				blasfeo_hp_samax(n-ii, v, &rmax, &jt);
+				if(!(rmax>fabsf(w[ip-ii])) | it==3)
+					break;
+				jp = jt + ii;
+				blasfeo_hp_sgetrf_rk_col(m, ii, jp, k0, nl, sD, di, dj, &svw, &svu);
+				blasfeo_hp_samax(m-ii, w, &wmax, &iw);
 				}
 			ipiv[ii] = ip;
 			jpiv[ii] = jp;
@@ -1748,6 +1811,13 @@ static int blasfeo_hp_sgetrf_rk_blk_lib4(int m, int n, float tol, struct blasfeo
 			d_00_inv = 1.0/w[0];
 			dD[ii] = d_00_inv;
 			pDi[ii*ps] = w[0];
+			// if the pivot is so small that its reciprocal overflows, divide by it
+			if(fabsf(w[0])<FLT_MIN)
+				{
+				for(kk=1; kk<m-ii; kk++)
+					w[kk] = w[kk] / w[0];
+				d_00_inv = 1.0;
+				}
 			for(k1=rr+1; k1<me; k1+=ps-(k1&(ps-1)))
 				{
 				pDk = pD + (k1 & ~(ps-1))*sdd + ii*ps;
@@ -1836,9 +1906,10 @@ void blasfeo_hp_sgetrf_rk(int m, int n, float tol, struct blasfeo_smat *sC, int 
 	int me = m + dir;
 
 	// the pivot is the largest in absolute value in both its row and its column of the trailing matrix:
-	// starting from the first column with an entry with absolute value > tol (and non-zero), the row
-	// and the column of the current candidate are searched alternately, until it is not improved;
-	// ties are broken by the first index, as in the reference implementation
+	// starting from the first column, the row and the column of the current candidate are searched
+	// alternately, until it is not improved; ties are broken by the first index, as in the reference
+	// implementation; if the rook pivot is <= tol (or zero), a full search of the trailing matrix
+	// verifies the rank decision (complete pivoting step)
 
 	// largest absolute value in the first column; in the following steps, it is computed for
 	// column ii+1 during the rank-1 update
@@ -1849,21 +1920,10 @@ void blasfeo_hp_sgetrf_rk(int m, int n, float tol, struct blasfeo_smat *sC, int 
 		{
 		// row ii
 		kk = ii + dir;
-		// first column of the trailing matrix with an entry with absolute value > tol (and non-zero)
+		// largest absolute value in the first column of the trailing matrix (from the previous update)
 		dmax = dmax_n;
 		ip = ip_n;
 		jp = ii;
-		if(!(dmax>tol & dmax!=0.0))
-			{
-			for(jp=ii+1; jp<n; jp++)
-				{
-				blasfeo_hp_scolamax_lib4(kk, me, pD+jp*ps, sdd, &dmax, &ip);
-				if(dmax>tol & dmax!=0.0)
-					break;
-				}
-			if(jp>=n)
-				break;
-			}
 		// rook search
 		while(1)
 			{
@@ -1887,6 +1947,14 @@ void blasfeo_hp_sgetrf_rk(int m, int n, float tol, struct blasfeo_smat *sC, int 
 				break;
 			dmax = cmax;
 			ip = it;
+			}
+		// small rook pivot: verify the rank decision with a full search of the trailing matrix, as in
+		// complete pivoting: stop if all its entries are <= tol (or zero), otherwise use its largest entry
+		if(!(dmax>tol & dmax!=0.0))
+			{
+			blasfeo_hp_sgeamax_lib4(kk, me, ii, n, pD, sdd, &dmax, &ip, &jp);
+			if(!(dmax>tol & dmax!=0.0))
+				break;
 			}
 		ipiv[ii] = ip - dir;
 		jpiv[ii] = jp;
@@ -1921,6 +1989,20 @@ void blasfeo_hp_sgetrf_rk(int m, int n, float tol, struct blasfeo_smat *sC, int 
 			}
 		d_00_inv = 1.0/pDi[ii*ps];
 		dD[ii] = d_00_inv;
+		// if the pivot is so small that its reciprocal overflows, divide the column of L by it here,
+		// and scale by one in the rank-1 update
+		if(fabsf(pDi[ii*ps])<FLT_MIN)
+			{
+			for(k0=kk+1; k0<me; k0=k1)
+				{
+				k1 = (k0 | (ps-1)) + 1;
+				k1 = k1<me ? k1 : me;
+				pDk = pD + (k0 & ~(ps-1))*sdd;
+				for(it=k0; it<k1; it++)
+					pDk[(it&(ps-1))+ii*ps] = pDk[(it&(ps-1))+ii*ps] / pDi[ii*ps];
+				}
+			d_00_inv = 1.0;
+			}
 		// scale column of L and rank-1 update of the trailing matrix;
 		// the largest absolute value of column ii+1 is computed on the fly (first panel containing it)
 		dmax_n = 0.0;

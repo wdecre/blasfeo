@@ -33,6 +33,8 @@
 *                                                                                                 *
 **************************************************************************************************/
 
+#include <float.h>
+
 
 
 //#if ! ( defined(HP_CM) & defined(DP) )
@@ -1676,16 +1678,20 @@ void REF_GETRF_FULLPIVOT(int m, int n, REAL tol, struct XMAT *sC, int ci, int cj
 // P row permutation (ipiv), Q column permutation (jpiv),
 // L lower unit trapezoidal, U upper trapezoidal;
 // the pivot is the largest in absolute value in both its row and its column of the trailing block:
-// starting from the first column with an entry with absolute value > tol (and non-zero),
-// alternately search the column and the row of the current candidate, until it is not improved
-// (ties are broken by the first index);
-// the factorization stops when all the entries of the trailing block have absolute value <= tol (or are zero):
+// starting from the first column, alternately search the column and the row of the current candidate,
+// until it is not improved (ties are broken by the first index);
+// if the rook pivot has absolute value <= tol (or is zero), the rank decision is verified as in complete
+// pivoting with a full search of the trailing block: if its largest absolute value is <= tol (or zero)
+// the factorization stops, otherwise this entry (first in column-major order) is used as pivot;
+// hence the factorization stops when all the entries of the trailing block have absolute value <= tol (or are zero):
 // the first rank columns of L and rows of U are computed, and
 // the trailing (m-rank)x(n-rank) block of D holds the Schur complement
 void REF_GETRF_ROOKPIVOT(int m, int n, REAL tol, struct XMAT *sC, int ci, int cj, struct XMAT *sD, int di, int dj, int *ipiv, int *jpiv, int *rank)
 	{
 	int ii, jj, kk, ip, jp, it, jt;
-	REAL dtmp, dmax, cmax, rmax, d_00_inv, d_ij;
+	REAL dtmp, dmax, cmax, rmax, d_00, d_00_inv, d_ij;
+	// smallest pivot whose reciprocal does not overflow
+	const REAL real_min = sizeof(REAL)==sizeof(double) ? (REAL) DBL_MIN : (REAL) FLT_MIN;
 #if defined(MF_COLMAJ) | defined(REF_BLAS)
 	int ldc = sC->m;
 	int ldd = sD->m;
@@ -1722,28 +1728,20 @@ void REF_GETRF_ROOKPIVOT(int m, int n, REAL tol, struct XMAT *sC, int ci, int cj
 	// factorize
 	for(ii=0; ii<iimax; ii++)
 		{
-		// first column of the trailing block with an entry with absolute value > tol (and non-zero)
+		// largest absolute value in the first column of the trailing block
 		dmax = 0.0;
 		ip = ii;
-		for(jp=ii; jp<n; jp++)
+		jp = ii;
+		for(kk=ii; kk<m; kk++)
 			{
-			dmax = 0.0;
-			ip = ii;
-			for(kk=ii; kk<m; kk++)
+			dtmp = XMATEL_D(ddi+kk, ddj+jp);
+			dtmp = dtmp>0.0 ? dtmp : -dtmp;
+			if(dtmp>dmax)
 				{
-				dtmp = XMATEL_D(ddi+kk, ddj+jp);
-				dtmp = dtmp>0.0 ? dtmp : -dtmp;
-				if(dtmp>dmax)
-					{
-					dmax = dtmp;
-					ip = kk;
-					}
+				dmax = dtmp;
+				ip = kk;
 				}
-			if(dmax>tol & dmax!=0.0)
-				break;
 			}
-		if(jp==n)
-			break;
 		// rook search: alternate row and column searches until the candidate is not improved
 		while(1)
 			{
@@ -1782,6 +1780,30 @@ void REF_GETRF_ROOKPIVOT(int m, int n, REAL tol, struct XMAT *sC, int ci, int cj
 			dmax = cmax;
 			ip = it;
 			}
+		// small rook pivot: verify the rank decision with a full search of the trailing block
+		if(!(dmax>tol & dmax!=0.0))
+			{
+			dmax = 0.0;
+			ip = ii;
+			jp = ii;
+			for(jj=ii; jj<n; jj++)
+				{
+				for(kk=ii; kk<m; kk++)
+					{
+					dtmp = XMATEL_D(ddi+kk, ddj+jj);
+					dtmp = dtmp>0.0 ? dtmp : -dtmp;
+					if(dtmp>dmax)
+						{
+						dmax = dtmp;
+						ip = kk;
+						jp = jj;
+						}
+					}
+				}
+			// numerical rank ii: all the entries of the trailing block are <= tol (or zero)
+			if(!(dmax>tol & dmax!=0.0))
+				break;
+			}
 		ipiv[ii] = ip;
 		jpiv[ii] = jp;
 		// swap rows
@@ -1804,12 +1826,23 @@ void REF_GETRF_ROOKPIVOT(int m, int n, REAL tol, struct XMAT *sC, int ci, int cj
 				XMATEL_D(ddi+kk, ddj+jp) = dtmp;
 				}
 			}
-		// scale column of L
-		d_00_inv = 1.0/XMATEL_D(ddi+ii, ddj+ii);
+		// scale column of L; if the pivot is so small that its reciprocal overflows, divide by it
+		d_00 = XMATEL_D(ddi+ii, ddj+ii);
+		d_00_inv = 1.0/d_00;
 		dD[ii] = d_00_inv;
-		for(kk=ii+1; kk<m; kk++)
+		if(fabs(d_00)>=real_min)
 			{
-			XMATEL_D(ddi+kk, ddj+ii) *= d_00_inv;
+			for(kk=ii+1; kk<m; kk++)
+				{
+				XMATEL_D(ddi+kk, ddj+ii) *= d_00_inv;
+				}
+			}
+		else
+			{
+			for(kk=ii+1; kk<m; kk++)
+				{
+				XMATEL_D(ddi+kk, ddj+ii) /= d_00;
+				}
 			}
 		// rank-1 update of the trailing block
 		for(jj=ii+1; jj<n; jj++)
@@ -3655,6 +3688,16 @@ void GETRF_ROWPIVOT(int m, int n, struct XMAT *sC, int ci, int cj, struct XMAT *
 
 #if ! ( defined(REF_BLAS) )
 void GETRF_FULLPIVOT(int m, int n, REAL tol, struct XMAT *sC, int ci, int cj, struct XMAT *sD, int di, int dj, int *ipiv, int *jpiv, int *rank)
+	{
+	REF_GETRF_FULLPIVOT(m, n, tol, sC, ci, cj, sD, di, dj, ipiv, jpiv, rank);
+	}
+#endif
+
+
+
+#if ! ( defined(REF_BLAS) ) & defined(GETRF_FULLPIVOT_OPT)
+// optimized version only for lib4, forward to the original
+void GETRF_FULLPIVOT_OPT(int m, int n, REAL tol, struct XMAT *sC, int ci, int cj, struct XMAT *sD, int di, int dj, int *ipiv, int *jpiv, int *rank)
 	{
 	REF_GETRF_FULLPIVOT(m, n, tol, sC, ci, cj, sD, di, dj, ipiv, jpiv, rank);
 	}

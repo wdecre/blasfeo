@@ -36,6 +36,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
+#include <float.h>
+#if defined(TARGET_X64_INTEL_HASWELL)
+#include <immintrin.h>
+#endif
 
 #include <blasfeo_common.h>
 #include <blasfeo_d_aux.h>
@@ -3786,10 +3790,364 @@ void blasfeo_hp_dgetrf_fp(int m, int n, double tol, struct blasfeo_dmat *sC, int
 
 	}
 
+// dgetrf full (complete) pivoting, rank revealing, optimized version of blasfeo_hp_dgetrf_fp:
+// same algorithm, pivots and arithmetic (bitwise identical results); on Haswell (AVX2 + FMA) the full panels
+// of the fused rank-1 update and pivot search, of the first pivot search and of the column swaps are vectorized
+// (the C code of the original is compiled to scalar instructions), with four independent accumulators for the
+// max; the copy of C into D is fused with the first pivot search; pivots so small that their reciprocal
+// overflows are handled by division
+void blasfeo_hp_dgetrf_fp_optimized(int m, int n, double tol, struct blasfeo_dmat *sC, int ci, int cj, struct blasfeo_dmat *sD, int di, int dj, int *ipiv, int *jpiv, int *rank)
+	{
+
+	const int ps = 4;
+
+	int cir = ci & (ps-1);
+	int dir = di & (ps-1);
+
+	int sdc = sC->cn;
+	int sdd = sD->cn;
+	double *pC = sC->pA + cj*ps + (ci - cir)*sdc;
+	double *pD = sD->pA + dj*ps + (di - dir)*sdd;
+	double *dD = sD->dA;
+
+	if(di==0 && dj==0)
+		sD->use_dA = 1;
+	else
+		sD->use_dA = 0;
+
+	*rank = 0;
+
+	if(m<=0 | n<=0)
+		return;
+
+	// copy C into D: fused with the first pivot search if C and D have the same row offset in the panel
+	int copy = 0;
+	if(pC+cir!=pD+dir)
+		{
+		if(cir==dir)
+			copy = 1;
+		else
+			blasfeo_dgecp(m, n, sC, ci, cj, sD, di, dj);
+		}
+
+	int ii, jj, kk, ll, ip, jp, k0, k1, kp, it;
+	double tmp, dmax, d_00, d_00_inv, d_ij, c_0, m_0;
+	double l_v[4], m_v[4];
+	double *pCk;
+#if defined(TARGET_X64_INTEL_HASWELL)
+	const __m256d v_sign = _mm256_set1_pd(-0.0);
+	__m256d v_l, v_c0, v_c1, v_c2, v_c3, v_m0, v_m1, v_m2, v_m3;
+#endif
+	double *pDi, *pDj, *pDk;
+
+	int p = m<n ? m : n;
+	// rows are indexed from the beginning of the first panel of D
+	int me = m + dir;
+
+	// the pivot is the element with largest absolute value, first in column-major order;
+	// the trailing matrix is processed one panel of rows at a time, keeping track of the
+	// largest absolute value in the panel; only if this is not smaller than the current
+	// pivot, the panel is searched again for the column (jp) and later the row (ip)
+
+	// pivot search
+	dmax = 0.0;
+	kp = dir;
+	jp = 0;
+	for(k0=dir; k0<me; k0=k1)
+		{
+		k1 = (k0 | (ps-1)) + 1;
+		k1 = k1<me ? k1 : me;
+		pDk = pD + (k0 & ~(ps-1))*sdd;
+		pCk = copy ? pC + (k0 & ~(ps-1))*sdc : pDk;
+		m_0 = 0.0;
+		if(k1-k0==ps)
+			{
+#if defined(TARGET_X64_INTEL_HASWELL)
+			// copy fused with the search; four independent accumulators for the max
+			v_m0 = _mm256_setzero_pd();
+			v_m1 = _mm256_setzero_pd();
+			v_m2 = _mm256_setzero_pd();
+			v_m3 = _mm256_setzero_pd();
+			for(jj=0; jj<n-3; jj+=4)
+				{
+				v_c0 = _mm256_loadu_pd(pCk+(jj+0)*ps);
+				v_c1 = _mm256_loadu_pd(pCk+(jj+1)*ps);
+				v_c2 = _mm256_loadu_pd(pCk+(jj+2)*ps);
+				v_c3 = _mm256_loadu_pd(pCk+(jj+3)*ps);
+				_mm256_storeu_pd(pDk+(jj+0)*ps, v_c0);
+				_mm256_storeu_pd(pDk+(jj+1)*ps, v_c1);
+				_mm256_storeu_pd(pDk+(jj+2)*ps, v_c2);
+				_mm256_storeu_pd(pDk+(jj+3)*ps, v_c3);
+				v_m0 = _mm256_max_pd(v_m0, _mm256_andnot_pd(v_sign, v_c0));
+				v_m1 = _mm256_max_pd(v_m1, _mm256_andnot_pd(v_sign, v_c1));
+				v_m2 = _mm256_max_pd(v_m2, _mm256_andnot_pd(v_sign, v_c2));
+				v_m3 = _mm256_max_pd(v_m3, _mm256_andnot_pd(v_sign, v_c3));
+				}
+			for(; jj<n; jj++)
+				{
+				v_c0 = _mm256_loadu_pd(pCk+jj*ps);
+				_mm256_storeu_pd(pDk+jj*ps, v_c0);
+				v_m0 = _mm256_max_pd(v_m0, _mm256_andnot_pd(v_sign, v_c0));
+				}
+			v_m0 = _mm256_max_pd(_mm256_max_pd(v_m0, v_m1), _mm256_max_pd(v_m2, v_m3));
+			_mm256_storeu_pd(m_v, v_m0);
+#else
+			for(ll=0; ll<ps; ll++)
+				{
+				m_v[ll] = 0.0;
+				}
+			for(jj=0; jj<n; jj++)
+				{
+				for(ll=0; ll<ps; ll++)
+					{
+					c_0 = pCk[ll+jj*ps];
+					pDk[ll+jj*ps] = c_0;
+					c_0 = fabs(c_0);
+					m_v[ll] = m_v[ll]>c_0 ? m_v[ll] : c_0;
+					}
+				}
+#endif
+			for(ll=0; ll<ps; ll++)
+				{
+				m_0 = m_0>m_v[ll] ? m_0 : m_v[ll];
+				}
+			}
+		else
+			{
+			for(jj=0; jj<n; jj++)
+				{
+				for(kk=k0; kk<k1; kk++)
+					{
+					c_0 = pCk[(kk&(ps-1))+jj*ps];
+					pDk[(kk&(ps-1))+jj*ps] = c_0;
+					c_0 = fabs(c_0);
+					m_0 = m_0>c_0 ? m_0 : c_0;
+					}
+				}
+			}
+		if(m_0>=dmax & m_0>0.0)
+			{
+			// search the panel for the first column containing the maximum
+			for(jj=0; jj<n; jj++)
+				{
+				for(kk=k0; kk<k1; kk++)
+					{
+					if(fabs(pDk[(kk&(ps-1))+jj*ps])==m_0)
+						goto found_0;
+					}
+				}
+			found_0:
+			if(jj<n & (m_0>dmax | jj<jp))
+				{
+				dmax = m_0;
+				kp = k0;
+				jp = jj;
+				}
+			}
+		}
+
+	// factorize
+	for(ii=0; ii<p; ii++)
+		{
+		if(!(dmax>tol) | dmax==0.0)
+			break;
+		// search the panel for the row of the pivot
+		ip = kp;
+		k1 = (kp | (ps-1)) + 1;
+		k1 = k1<me ? k1 : me;
+		pDk = pD + (kp & ~(ps-1))*sdd + jp*ps;
+		for(kk=kp; kk<k1; kk++)
+			{
+			if(fabs(pDk[kk&(ps-1)])==dmax)
+				{
+				ip = kk;
+				break;
+				}
+			}
+		ipiv[ii] = ip - dir;
+		jpiv[ii] = jp;
+		// pointer to row ii
+		kk = ii + dir;
+		pDi = pD + (kk & ~(ps-1))*sdd + (kk&(ps-1));
+		// swap rows
+		if(ip!=kk)
+			{
+			pDj = pD + (ip & ~(ps-1))*sdd + (ip&(ps-1));
+			for(jj=0; jj<n; jj++)
+				{
+				tmp = pDi[jj*ps];
+				pDi[jj*ps] = pDj[jj*ps];
+				pDj[jj*ps] = tmp;
+				}
+			}
+		// swap columns
+		if(jp!=ii)
+			{
+			for(k0=dir; k0<me; k0=k1)
+				{
+				k1 = (k0 | (ps-1)) + 1;
+				k1 = k1<me ? k1 : me;
+				pDk = pD + (k0 & ~(ps-1))*sdd;
+#if defined(TARGET_X64_INTEL_HASWELL)
+				if(k1-k0==ps)
+					{
+					v_c0 = _mm256_loadu_pd(pDk+ii*ps);
+					v_c1 = _mm256_loadu_pd(pDk+jp*ps);
+					_mm256_storeu_pd(pDk+ii*ps, v_c1);
+					_mm256_storeu_pd(pDk+jp*ps, v_c0);
+					continue;
+					}
+#endif
+				for(it=k0; it<k1; it++)
+					{
+					tmp = pDk[(it&(ps-1))+ii*ps];
+					pDk[(it&(ps-1))+ii*ps] = pDk[(it&(ps-1))+jp*ps];
+					pDk[(it&(ps-1))+jp*ps] = tmp;
+					}
+				}
+			}
+		d_00 = pDi[ii*ps];
+		d_00_inv = 1.0/d_00;
+		dD[ii] = d_00_inv;
+		// if the pivot is so small that its reciprocal overflows, divide the column of L by it here,
+		// and scale by one in the rank-1 update
+		if(fabs(d_00)<DBL_MIN)
+			{
+			for(k0=kk+1; k0<me; k0=k1)
+				{
+				k1 = (k0 | (ps-1)) + 1;
+				k1 = k1<me ? k1 : me;
+				pDk = pD + (k0 & ~(ps-1))*sdd;
+				for(it=k0; it<k1; it++)
+					pDk[(it&(ps-1))+ii*ps] = pDk[(it&(ps-1))+ii*ps] / d_00;
+				}
+			d_00_inv = 1.0;
+			}
+		// scale column of L, rank-1 update of the trailing matrix and pivot search
+		dmax = 0.0;
+		kp = ii+1+dir;
+		jp = ii+1;
+		for(k0=ii+1+dir; k0<me; k0=k1)
+			{
+			k1 = (k0 | (ps-1)) + 1;
+			k1 = k1<me ? k1 : me;
+			pDk = pD + (k0 & ~(ps-1))*sdd;
+			m_0 = 0.0;
+			if(k1-k0==ps)
+				{
+#if defined(TARGET_X64_INTEL_HASWELL)
+				// scale, rank-1 update (fma, as the scalar code) and max with four independent accumulators
+				v_l = _mm256_mul_pd(_mm256_loadu_pd(pDk+ii*ps), _mm256_set1_pd(d_00_inv));
+				_mm256_storeu_pd(pDk+ii*ps, v_l);
+				v_m0 = _mm256_setzero_pd();
+				v_m1 = _mm256_setzero_pd();
+				v_m2 = _mm256_setzero_pd();
+				v_m3 = _mm256_setzero_pd();
+				for(jj=ii+1; jj<n-3; jj+=4)
+					{
+					v_c0 = _mm256_fnmadd_pd(v_l, _mm256_broadcast_sd(pDi+(jj+0)*ps), _mm256_loadu_pd(pDk+(jj+0)*ps));
+					v_c1 = _mm256_fnmadd_pd(v_l, _mm256_broadcast_sd(pDi+(jj+1)*ps), _mm256_loadu_pd(pDk+(jj+1)*ps));
+					v_c2 = _mm256_fnmadd_pd(v_l, _mm256_broadcast_sd(pDi+(jj+2)*ps), _mm256_loadu_pd(pDk+(jj+2)*ps));
+					v_c3 = _mm256_fnmadd_pd(v_l, _mm256_broadcast_sd(pDi+(jj+3)*ps), _mm256_loadu_pd(pDk+(jj+3)*ps));
+					_mm256_storeu_pd(pDk+(jj+0)*ps, v_c0);
+					_mm256_storeu_pd(pDk+(jj+1)*ps, v_c1);
+					_mm256_storeu_pd(pDk+(jj+2)*ps, v_c2);
+					_mm256_storeu_pd(pDk+(jj+3)*ps, v_c3);
+					v_m0 = _mm256_max_pd(v_m0, _mm256_andnot_pd(v_sign, v_c0));
+					v_m1 = _mm256_max_pd(v_m1, _mm256_andnot_pd(v_sign, v_c1));
+					v_m2 = _mm256_max_pd(v_m2, _mm256_andnot_pd(v_sign, v_c2));
+					v_m3 = _mm256_max_pd(v_m3, _mm256_andnot_pd(v_sign, v_c3));
+					}
+				for(; jj<n; jj++)
+					{
+					v_c0 = _mm256_fnmadd_pd(v_l, _mm256_broadcast_sd(pDi+jj*ps), _mm256_loadu_pd(pDk+jj*ps));
+					_mm256_storeu_pd(pDk+jj*ps, v_c0);
+					v_m0 = _mm256_max_pd(v_m0, _mm256_andnot_pd(v_sign, v_c0));
+					}
+				v_m0 = _mm256_max_pd(_mm256_max_pd(v_m0, v_m1), _mm256_max_pd(v_m2, v_m3));
+				_mm256_storeu_pd(m_v, v_m0);
+#else
+				for(ll=0; ll<ps; ll++)
+					{
+					l_v[ll] = pDk[ll+ii*ps] * d_00_inv;
+					pDk[ll+ii*ps] = l_v[ll];
+					m_v[ll] = 0.0;
+					}
+				for(jj=ii+1; jj<n; jj++)
+					{
+					d_ij = pDi[jj*ps];
+					for(ll=0; ll<ps; ll++)
+						{
+						c_0 = pDk[ll+jj*ps] - l_v[ll] * d_ij;
+						pDk[ll+jj*ps] = c_0;
+						c_0 = fabs(c_0);
+						m_v[ll] = m_v[ll]>c_0 ? m_v[ll] : c_0;
+						}
+					}
+#endif
+				for(ll=0; ll<ps; ll++)
+					{
+					m_0 = m_0>m_v[ll] ? m_0 : m_v[ll];
+					}
+				}
+			else
+				{
+				for(kk=k0; kk<k1; kk++)
+					{
+					pDk[(kk&(ps-1))+ii*ps] *= d_00_inv;
+					}
+				for(jj=ii+1; jj<n; jj++)
+					{
+					d_ij = pDi[jj*ps];
+					for(kk=k0; kk<k1; kk++)
+						{
+						c_0 = pDk[(kk&(ps-1))+jj*ps] - pDk[(kk&(ps-1))+ii*ps] * d_ij;
+						pDk[(kk&(ps-1))+jj*ps] = c_0;
+						c_0 = fabs(c_0);
+						m_0 = m_0>c_0 ? m_0 : c_0;
+						}
+					}
+				}
+			if(m_0>=dmax & m_0>0.0)
+				{
+				// search the panel for the first column containing the maximum
+				for(jj=ii+1; jj<n; jj++)
+					{
+					for(kk=k0; kk<k1; kk++)
+						{
+						if(fabs(pDk[(kk&(ps-1))+jj*ps])==m_0)
+							goto found_1;
+						}
+					}
+				found_1:
+				if(jj<n & (m_0>dmax | jj<jp))
+					{
+					dmax = m_0;
+					kp = k0;
+					jp = jj;
+					}
+				}
+			}
+		}
+
+	*rank = ii;
+
+	// no pivoting on the rank deficient part
+	for(; ii<p; ii++)
+		{
+		ipiv[ii] = ii;
+		jpiv[ii] = ii;
+		dD[ii] = 0.0;
+		}
+
+	return;
+
+	}
+
 
 // largest absolute value (first in case of ties) in rows k0,...,me-1 of a column of a lib4 matrix;
 // pD points to the column in the first panel, rows are indexed from the beginning of the first panel
-static void blasfeo_hp_dcolamax_lib4(int k0, int me, double *pD, int sdd, double *ptr_amax, int *ptr_iamax)
+static inline void blasfeo_hp_dcolamax_lib4(int k0, int me, double *pD, int sdd, double *ptr_amax, int *ptr_iamax)
 	{
 	const int ps = 4;
 	int k1, kk, ll, kp;
@@ -3840,6 +4198,34 @@ static void blasfeo_hp_dcolamax_lib4(int k0, int me, double *pD, int sdd, double
 		}
 	*ptr_amax = amax;
 	*ptr_iamax = kp;
+	return;
+	}
+
+
+
+// largest absolute value (first in column-major order) in rows k0,...,me-1 and columns j0,...,n-1
+// of a lib4 matrix; rows are indexed from the beginning of the first panel
+static void blasfeo_hp_dgeamax_lib4(int k0, int me, int j0, int n, double *pD, int sdd, double *ptr_amax, int *ptr_iamax, int *ptr_jamax)
+	{
+	const int ps = 4;
+	int jj, it, imax, jmax;
+	double c_0, amax;
+	amax = 0.0;
+	imax = k0;
+	jmax = j0;
+	for(jj=j0; jj<n; jj++)
+		{
+		blasfeo_hp_dcolamax_lib4(k0, me, pD+jj*ps, sdd, &c_0, &it);
+		if(c_0>amax)
+			{
+			amax = c_0;
+			imax = it;
+			jmax = jj;
+			}
+		}
+	*ptr_amax = amax;
+	*ptr_iamax = imax;
+	*ptr_jamax = jmax;
 	return;
 	}
 
@@ -3947,8 +4333,8 @@ static int blasfeo_hp_dgetrf_rk_blk_lib4(int m, int n, double tol, struct blasfe
 	double *pD = sD->pA + dj*ps + (di - dir)*sdd;
 	double *dD = sD->dA;
 
-	int ii, jj, kk, k0, k1, kb, nl, rr, ip, jp, it, jt, rank;
-	double tmp, dmax, rmax, cmax, d_00_inv;
+	int ii, jj, kk, k0, k1, kb, nl, rr, ip, jp, it, jt, iw, rank;
+	double tmp, dmax, rmax, cmax, wmax, d_00_inv;
 	double *pDi, *pDj, *pDk;
 
 	int p = m<n ? m : n;
@@ -3985,22 +4371,13 @@ static int blasfeo_hp_dgetrf_rk_blk_lib4(int m, int n, double tol, struct blasfe
 			nl = ii - k0;
 			// row ii
 			rr = ii + dir;
-			// first column of the trailing matrix with an entry with absolute value > tol (and non-zero)
-			for(jp=ii; jp<n; jp++)
-				{
-				blasfeo_hp_dgetrf_rk_col(m, ii, jp, k0, nl, sD, di, dj, &svw, &svu);
-				blasfeo_hp_damax(m-ii, w, &dmax, &ip);
-				if(dmax>tol & dmax!=0.0)
-					break;
-				}
-			if(jp==n)
-				{
-				// rank deficient: apply the delayed update, the trailing matrix holds the Schur complement
-				if(nl>0)
-					blasfeo_dgemm_nn(m-ii, n-ii, nl, -1.0, sD, di+ii, dj+k0, sD, di+k0, dj+ii, 1.0, sD, di+ii, dj+ii, sD, di+ii, dj+ii);
-				rank = ii;
-				goto end;
-				}
+			// largest absolute value in the first column of the trailing matrix
+			jp = ii;
+			blasfeo_hp_dgetrf_rk_col(m, ii, jp, k0, nl, sD, di, dj, &svw, &svu);
+			blasfeo_hp_damax(m-ii, w, &dmax, &ip);
+			// largest absolute value of the computed column w, and its first row
+			wmax = dmax;
+			iw = ip;
 			ip += ii;
 			// rook search: on exit, w holds column jp and v holds row ip, both updated
 			while(1)
@@ -4013,10 +4390,53 @@ static int blasfeo_hp_dgetrf_rk_blk_lib4(int m, int n, double tol, struct blasfe
 				jp = jt + ii;
 				blasfeo_hp_dgetrf_rk_col(m, ii, jp, k0, nl, sD, di, dj, &svw, &svu);
 				blasfeo_hp_damax(m-ii, w, &cmax, &it);
+				wmax = cmax;
+				iw = it;
 				if(!(cmax>dmax))
 					break;
 				dmax = cmax;
 				ip = it + ii;
+				}
+			// small rook pivot: verify the rank decision with a full search of the trailing matrix, as in
+			// complete pivoting; the delayed update is applied first, and the block restarts at ii
+			if(!(dmax>tol & dmax!=0.0))
+				{
+				if(nl>0)
+					{
+					blasfeo_dgemm_nn(m-ii, n-ii, nl, -1.0, sD, di+ii, dj+k0, sD, di+k0, dj+ii, 1.0, sD, di+ii, dj+ii, sD, di+ii, dj+ii);
+					k0 = ii;
+					nl = 0;
+					}
+				blasfeo_hp_dgeamax_lib4(rr, me, ii, n, pD, sdd, &dmax, &ip, &jp);
+				if(!(dmax>tol & dmax!=0.0))
+					{
+					// numerical rank ii: the trailing matrix holds the Schur complement
+					rank = ii;
+					goto end;
+					}
+				// complete pivoting step
+				ip -= dir;
+				blasfeo_hp_dgetrf_rk_col(m, ii, jp, k0, nl, sD, di, dj, &svw, &svu);
+				blasfeo_hp_damax(m-ii, w, &wmax, &iw);
+				blasfeo_hp_dgetrf_rk_row(n, ip, ii, k0, nl, sD, di, dj, &svv, &svl);
+				}
+			// the entries of the searched rows and columns are computed separately (gemv_t and gemv_n) and
+			// rounded differently, which matters if the trailing matrix is at rounding level (rank deficient
+			// matrices): make the pivot the largest in absolute value in its computed column w, so that
+			// |L| <= 1, and (in a few steps of rook search on the computed values) in its computed row v
+			for(it=0; it<4; it++)
+				{
+				if(wmax>fabs(w[ip-ii]))
+					{
+					ip = iw + ii;
+					blasfeo_hp_dgetrf_rk_row(n, ip, ii, k0, nl, sD, di, dj, &svv, &svl);
+					}
+				blasfeo_hp_damax(n-ii, v, &rmax, &jt);
+				if(!(rmax>fabs(w[ip-ii])) | it==3)
+					break;
+				jp = jt + ii;
+				blasfeo_hp_dgetrf_rk_col(m, ii, jp, k0, nl, sD, di, dj, &svw, &svu);
+				blasfeo_hp_damax(m-ii, w, &wmax, &iw);
 				}
 			ipiv[ii] = ip;
 			jpiv[ii] = jp;
@@ -4058,6 +4478,13 @@ static int blasfeo_hp_dgetrf_rk_blk_lib4(int m, int n, double tol, struct blasfe
 			d_00_inv = 1.0/w[0];
 			dD[ii] = d_00_inv;
 			pDi[ii*ps] = w[0];
+			// if the pivot is so small that its reciprocal overflows, divide by it
+			if(fabs(w[0])<DBL_MIN)
+				{
+				for(kk=1; kk<m-ii; kk++)
+					w[kk] = w[kk] / w[0];
+				d_00_inv = 1.0;
+				}
 			for(k1=rr+1; k1<me; k1+=ps-(k1&(ps-1)))
 				{
 				pDk = pD + (k1 & ~(ps-1))*sdd + ii*ps;
@@ -4146,9 +4573,10 @@ void blasfeo_hp_dgetrf_rk(int m, int n, double tol, struct blasfeo_dmat *sC, int
 	int me = m + dir;
 
 	// the pivot is the largest in absolute value in both its row and its column of the trailing matrix:
-	// starting from the first column with an entry with absolute value > tol (and non-zero), the row
-	// and the column of the current candidate are searched alternately, until it is not improved;
-	// ties are broken by the first index, as in the reference implementation
+	// starting from the first column, the row and the column of the current candidate are searched
+	// alternately, until it is not improved; ties are broken by the first index, as in the reference
+	// implementation; if the rook pivot is <= tol (or zero), a full search of the trailing matrix
+	// verifies the rank decision (complete pivoting step)
 
 	// largest absolute value in the first column; in the following steps, it is computed for
 	// column ii+1 during the rank-1 update
@@ -4159,21 +4587,10 @@ void blasfeo_hp_dgetrf_rk(int m, int n, double tol, struct blasfeo_dmat *sC, int
 		{
 		// row ii
 		kk = ii + dir;
-		// first column of the trailing matrix with an entry with absolute value > tol (and non-zero)
+		// largest absolute value in the first column of the trailing matrix (from the previous update)
 		dmax = dmax_n;
 		ip = ip_n;
 		jp = ii;
-		if(!(dmax>tol & dmax!=0.0))
-			{
-			for(jp=ii+1; jp<n; jp++)
-				{
-				blasfeo_hp_dcolamax_lib4(kk, me, pD+jp*ps, sdd, &dmax, &ip);
-				if(dmax>tol & dmax!=0.0)
-					break;
-				}
-			if(jp>=n)
-				break;
-			}
 		// rook search
 		while(1)
 			{
@@ -4197,6 +4614,14 @@ void blasfeo_hp_dgetrf_rk(int m, int n, double tol, struct blasfeo_dmat *sC, int
 				break;
 			dmax = cmax;
 			ip = it;
+			}
+		// small rook pivot: verify the rank decision with a full search of the trailing matrix, as in
+		// complete pivoting: stop if all its entries are <= tol (or zero), otherwise use its largest entry
+		if(!(dmax>tol & dmax!=0.0))
+			{
+			blasfeo_hp_dgeamax_lib4(kk, me, ii, n, pD, sdd, &dmax, &ip, &jp);
+			if(!(dmax>tol & dmax!=0.0))
+				break;
 			}
 		ipiv[ii] = ip - dir;
 		jpiv[ii] = jp;
@@ -4231,6 +4656,20 @@ void blasfeo_hp_dgetrf_rk(int m, int n, double tol, struct blasfeo_dmat *sC, int
 			}
 		d_00_inv = 1.0/pDi[ii*ps];
 		dD[ii] = d_00_inv;
+		// if the pivot is so small that its reciprocal overflows, divide the column of L by it here,
+		// and scale by one in the rank-1 update
+		if(fabs(pDi[ii*ps])<DBL_MIN)
+			{
+			for(k0=kk+1; k0<me; k0=k1)
+				{
+				k1 = (k0 | (ps-1)) + 1;
+				k1 = k1<me ? k1 : me;
+				pDk = pD + (k0 & ~(ps-1))*sdd;
+				for(it=k0; it<k1; it++)
+					pDk[(it&(ps-1))+ii*ps] = pDk[(it&(ps-1))+ii*ps] / pDi[ii*ps];
+				}
+			d_00_inv = 1.0;
+			}
 		// scale column of L and rank-1 update of the trailing matrix;
 		// the largest absolute value of column ii+1 is computed on the fly (first panel containing it)
 		dmax_n = 0.0;
@@ -5249,6 +5688,13 @@ void blasfeo_dgetrf_rp(int m, int n, struct blasfeo_dmat *sC, int ci, int cj, st
 void blasfeo_dgetrf_fp(int m, int n, double tol, struct blasfeo_dmat *sC, int ci, int cj, struct blasfeo_dmat *sD, int di, int dj, int *ipiv, int *jpiv, int *rank)
 	{
 	blasfeo_hp_dgetrf_fp(m, n, tol, sC, ci, cj, sD, di, dj, ipiv, jpiv, rank);
+	}
+
+
+
+void blasfeo_dgetrf_fp_optimized(int m, int n, double tol, struct blasfeo_dmat *sC, int ci, int cj, struct blasfeo_dmat *sD, int di, int dj, int *ipiv, int *jpiv, int *rank)
+	{
+	blasfeo_hp_dgetrf_fp_optimized(m, n, tol, sC, ci, cj, sD, di, dj, ipiv, jpiv, rank);
 	}
 
 

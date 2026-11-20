@@ -258,7 +258,8 @@ void blasfeo_ref_sgetrf_rp(int m, int n, struct blasfeo_smat *sC, int ci, int cj
 // stops at the first pivot with absolute value <= tol (or zero), the number of pivots is returned in rank
 void blasfeo_ref_sgetrf_fp(int m, int n, float tol, struct blasfeo_smat *sC, int ci, int cj, struct blasfeo_smat *sD, int di, int dj, int *ipiv, int *jpiv, int *rank);
 // D <= lu( C ) ; rook pivoting, rank revealing: P * C * Q = L * U, with P (Q) the row (column) swaps in ipiv (jpiv), as in rowpe (colpe) ;
-// the pivot is the largest in absolute value in both its row and column of the trailing block ;
+// the pivot is the largest in absolute value in both its row and column of the trailing block (rook pivot) ;
+// if the rook pivot is <= tol (or zero), a full search of the trailing block verifies the rank decision as in complete pivoting ;
 // stops when all the entries of the trailing block have absolute value <= tol (or are zero), the number of pivots is returned in rank
 void blasfeo_ref_sgetrf_rk(int m, int n, float tol, struct blasfeo_smat *sC, int ci, int cj, struct blasfeo_smat *sD, int di, int dj, int *ipiv, int *jpiv, int *rank);
 // D <= qr( C )
