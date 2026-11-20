@@ -123,6 +123,28 @@
           "int_ptr": "rank"
         }
       },
+      "getrf_rookpivot":{
+        "common_name": "Sequential General LU factorization with rook pivot, rank revealing",
+        "doc": [
+          "LU factorization of a general M-by-N matrix A with rook pivot: the pivot is the largest in absolute value in both its row and its column",
+          "The factorization stops when all the entries of the trailing block have absolute value smaller than or equal to tol",
+          "P * A * Q = L * U"
+        ],
+        "signature":{
+          "int": "rows",
+          "int": "columns",
+          "FLOAT": "tolerance",
+          "STRMAT_ptr": "input matrix",
+          "int": "input (A) row offset",
+          "int": "input (A) column offset",
+          "STRMAT_ptr": "LU: lower and upper trinagular (trapeziodal) condensed matrix",
+          "int": "output (LU) row offset",
+          "int": "output (LU) column offset",
+          "int_ptr": "row pivot vector",
+          "int_ptr": "column pivot vector",
+          "int_ptr": "rank"
+        }
+      },
       "geqrf":{},
       "geqrf_worksize":{},
       "gelqf":{},

@@ -201,6 +201,13 @@
           "getrf_fp"
         ]
       },
+      "getrf_rookpivot": {
+        "testclass_src": "getrf_rk.c",
+        "flags":{},
+        "routines": [
+          "getrf_rk"
+        ]
+      },
       "getrf_nopivot": {
         "testclass_src": "getrf_nopivot.c",
         "flags":{},

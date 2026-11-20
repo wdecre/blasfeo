@@ -86,7 +86,8 @@
     "potrf_l_mn",
     "potrf_u",
     "getrf_rp",
-    "getrf_fp"
+    "getrf_fp",
+    "getrf_rk"
   ]
 }
 
